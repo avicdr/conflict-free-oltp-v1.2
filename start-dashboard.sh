@@ -12,11 +12,6 @@ BACKEND_PID=$!
 # Wait for backend
 sleep 2
 
-# Start frontend
-echo "▶ Starting Next.js frontend on :3000"
-cd dashboard && npm run dev &
-FRONTEND_PID=$!
-
 echo ""
 echo "✅ CRDTdb Dashboard running!"
 echo "   Dashboard: http://localhost:3000"
