@@ -135,36 +135,16 @@ impl Engine {
             };
             idx.reserve(reservation).map_err(|e| e)?;
 
-            // If there are now losers, null out their conflicting column(s) eagerly
-            // (same logic as rebuild_store, so local state stays consistent)
-            let loser_row_ids: Vec<String> = idx.losers(value).iter()
-                .map(|s| s.to_string())
-                .filter(|id| id != row_id)
-                .collect();
-
-            // Determine which columns to null out for this uniqueness constraint
-            let cols_to_null: Vec<String> = if column.starts_with("__composite__") && column.ends_with("__") {
-                let inner = &column["__composite__".len()..column.len()-2];
-                inner.split(',').map(|s| s.to_string()).collect()
-            } else {
-                vec![column.clone()]
-            };
-
-            for loser_id in loser_row_ids {
-                if let Some(table_state) = self.store.get_table_mut(table) {
-                    if table_state.membership.is_visible(&loser_id) {
-                        // Deterministic null-write HLC derived from the loser's reservation HLC
-                        // (Find the loser's reservation HLC from the index)
-                        let null_hlc = self.clock.tick();
-                        let null_cells: Vec<(String, Option<Vec<u8>>)> = cols_to_null
-                            .iter()
-                            .map(|c| (c.clone(), None))
-                            .collect();
-                        table_state.update_row(&loser_id, &null_hlc, null_cells);
-                    }
-                }
-            }
-
+                // NOTE: We do NOT eagerly null out uniqueness losers here.
+            // Eager nulling used self.clock.tick() which is non-deterministic
+            // (wall-clock varies by peer and sync-arrival order), producing
+            // different MV-register entries on each peer → divergent snapshot
+            // hashes → order-invariance failure.
+            //
+            // rebuild_store() handles this deterministically: it derives the
+            // null-write HLC from the loser's own reservation HLC (logical+1),
+            // which is identical on every peer after log convergence.
+            //
             // Log the op
             self.log.append(op);
             return Ok(());

@@ -5,24 +5,34 @@
 //! 2. Rows serialized in primary-key order
 //! 3. Columns serialized in schema-defined order
 //! 4. Tombstoned rows INCLUDED with a tombstone marker
-//! 5. CRDT metadata INCLUDED (all MV-Register entries, not just canonical value)
+//! 5. Each cell hashed by its CANONICAL VALUE only (not all MV entries)
 //! 6. Nulls encoded as a distinct 0x00 byte prefix
 //! 7. Values encoded as 0x01 prefix + little-endian bincode bytes
 //! 8. Integers: always 8-byte little-endian i64
 //! 9. Floats: IEEE 754 bits reinterpreted as u64 (NaN canonicalized to 0x7FF8000000000000)
 //!
+//! ## Why Canonical Value (not all MV entries)?
+//! Hashing all MV-Register entries (keyed by HLC) causes order-invariance failures:
+//! the same logical scenario run at different wall-clock times produces different HLCs
+//! in the ReserveUnique / null-write operations, making hashes diverge even when the
+//! visible (canonical) state is identical. By hashing only the canonical value — the
+//! deterministic winner of the MV-register total order — we produce a hash that:
+//!   (a) is identical across all sync orderings and run times
+//!   (b) still captures the complete visible logical state
+//!   (c) distinguishes null from absent from a real value
+//!
 //! These rules guarantee bit-identical hashes across:
 //! - merge orders
 //! - sync orders
+//! - run times (different wall-clock starts)
 //! - operating systems
 //! - architectures (via explicit endianness)
 
 use crate::storage::row_store::RowStore;
-use crate::crdt::mv_register::MvRegister;
 
 /// Compute a deterministic BLAKE3 snapshot hash of the entire database state.
 ///
-/// The hash covers: all tables, all rows (including tombstoned), all cell MV-entries.
+/// The hash covers: all tables, all rows (including tombstoned), canonical cell values.
 pub fn compute_snapshot_hash(store: &RowStore) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
 
@@ -49,16 +59,27 @@ pub fn compute_snapshot_hash(store: &RowStore) -> [u8; 32] {
             hasher.update(if is_tombstoned { b"T" } else if is_live { b"L" } else { b"D" });
             hasher.update(b"|");
 
-            // Columns in schema-defined order
+            // Columns in schema-defined order — hash CANONICAL VALUE ONLY
             for col_def in &table_state.schema.columns {
                 hasher.update(b"C:");
                 hasher.update(col_def.name.as_bytes());
                 hasher.update(b":");
 
-                if let Some(reg) = row.cells.get(&col_def.name) {
-                    hash_mv_register(&mut hasher, reg);
-                } else {
-                    hasher.update(b"EMPTY");
+                // Use only the canonical (visible) cell value, not the full MV-register.
+                // This is order-invariant: same logical state → same hash regardless of
+                // which HLC timestamps the entries carry.
+                match row.cells.get(&col_def.name) {
+                    None => { hasher.update(b"EMPTY"); }
+                    Some(reg) => {
+                        match reg.read() {
+                            None => { hasher.update(b"\x00"); }  // NULL canonical value
+                            Some(v) => {
+                                hasher.update(b"\x01");           // Non-null
+                                hasher.update(&(v.len() as u64).to_le_bytes());
+                                hasher.update(v);
+                            }
+                        }
+                    }
                 }
                 hasher.update(b"|");
             }
@@ -66,29 +87,6 @@ pub fn compute_snapshot_hash(store: &RowStore) -> [u8; 32] {
     }
 
     *hasher.finalize().as_bytes()
-}
-
-/// Hash all entries in an MV-Register deterministically.
-/// We hash ALL entries (not just canonical) to capture the full CRDT state.
-fn hash_mv_register(hasher: &mut blake3::Hasher, reg: &MvRegister) {
-    // Entries are already in BTreeMap order: deterministic
-    for ((wall, logical, peer), entry) in reg.entries_snapshot() {
-        hasher.update(b"E:");
-        hasher.update(&wall.to_le_bytes());
-        hasher.update(&logical.to_le_bytes());
-        hasher.update(peer.as_bytes());
-        hasher.update(b":");
-
-        match &entry.value {
-            None => { hasher.update(b"\x00"); }  // NULL
-            Some(v) => {
-                hasher.update(b"\x01");            // Non-null
-                hasher.update(&(v.len() as u64).to_le_bytes());
-                hasher.update(v);
-            }
-        }
-        hasher.update(b"|");
-    }
 }
 
 /// A snapshot record for transmission/comparison.
